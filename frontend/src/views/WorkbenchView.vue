@@ -70,6 +70,10 @@
       </tbody>
     </table>
 
+    <div v-if="showHistoryPanel" class="history-host">
+      <LineageHistoryPanel :module-key="meta.key" :rows="rows" :on-written-back="reload" />
+    </div>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -103,10 +107,14 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import LineageHistoryPanel from '@/views/LineageHistoryPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const showHistoryPanel = computed(() =>
+  ['lineage_graph', 'metadata_diff'].includes(props.moduleKey),
+)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

@@ -12,6 +12,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.lineage_graph import (
+    CONCLUSION_DISJOINT,
+    CONCLUSION_NEEDS_EVIDENCE,
+    CONCLUSION_SIGNABLE,
+    LineageGraphService,
+)
 from app.store import store
 
 
@@ -19,7 +25,8 @@ class MetadataDiffService(BaseModuleService):
     MODULE = "metadata_diff"
     ENTITY = "变更记录"
     OPERATION_TERM = "校验"
-    LIST_FIELDS = ["变更编号", "变更对象", "变更类型", "旧值", "新值", "变更批次", "影响评估", "变更时间"]
+    LIST_FIELDS = ["变更编号", "变更对象", "变更类型", "旧值", "新值", "变更批次",
+                   "影响评估", "变更时间", "历史依赖明细", "影响清单状态"]
     REQUIRED_FIELDS = ["变更编号", "变更对象", "变更类型"]
     STATUS_ORDER = ["草稿", "待审核", "已确认", "已回滚"]
     ACTION_RULES = {"提交审核": "待审核", "确认变更": "已确认", "执行回滚": "已回滚"}
@@ -115,6 +122,143 @@ class MetadataDiffService(BaseModuleService):
         for lr in affected:
             lr["abnormal"] = True
             lr["status"] = "待校验"
+
+    # ------------------------------------------------------------------
+    # 历史依赖：变更影响清单回写与评审检索
+    # ------------------------------------------------------------------
+    def write_historical_impact(
+        self,
+        diff_id: int,
+        target_date: str | None = None,
+        range_start: str | None = None,
+        range_end: str | None = None,
+        max_depth: int = 4,
+    ) -> dict[str, Any]:
+        """历史查询结果回写元数据变更影响清单。
+
+        以变更对象对应的表为起点做关系版本历史查询，把可直接签发、需补证、
+        时间无交集三类路径连同缺证片段固化到变更记录的「历史依赖明细」字段，
+        使评审结论可以随变更审查保存、复核和审计。
+        """
+        diff = store.find(self.MODULE, diff_id)
+        if diff is None:
+            return {"ok": False, "message": f"变更记录 {diff_id} 不存在或已归档"}
+
+        table_name = str(diff.get("变更对象", "")).split(".", 1)[0]
+        lineage_svc = LineageGraphService()
+        detail = lineage_svc.query_relation_versions(
+            table_name,
+            target_date=target_date,
+            range_start=range_start,
+            range_end=range_end,
+            direction="downstream",
+            max_depth=max_depth,
+            include_missing=True,
+        )
+
+        impact_summary = {
+            "回写时间": datetime.now(timezone.utc).isoformat(),
+            "目标日期": target_date,
+            "查询区间": detail["查询区间"],
+            "路径总数": detail["路径总数"],
+            "可直接签发数": detail["可直接签发数"],
+            "需补证数": detail["需补证数"],
+            "时间无交集数": detail["时间无交集数"],
+            "可直接签发下游": [p["终点表"] for p in detail["可直接签发路径"]],
+            "需补证下游": [p["终点表"] for p in detail["需补证路径"]],
+            "时间无交集下游": [p["终点表"] for p in detail["时间无交集路径"]],
+            "缺证片段": detail["缺证片段"],
+        }
+        diff["历史依赖明细"] = impact_summary
+        # 存在需补证对象时影响清单保持待审核，全部可证实时转为可评审
+        if detail["需补证数"] > 0:
+            diff["影响清单状态"] = "待补证"
+            diff["pending"] = True
+            diff["abnormal"] = True
+        elif detail["路径总数"] > 0:
+            diff["影响清单状态"] = "可评审"
+        else:
+            diff["影响清单状态"] = "无下游依赖"
+        return {"ok": True, "message": "历史依赖明细已回写变更影响清单",
+                "变更编号": diff.get("变更编号"), "影响清单状态": diff["影响清单状态"],
+                "历史依赖明细": impact_summary}
+
+    def review_verifiable_downstream(
+        self,
+        table_name: str,
+        target_date: str | None = None,
+        range_start: str | None = None,
+        range_end: str | None = None,
+    ) -> dict[str, Any]:
+        """变更评审：用历史依赖明细检索可证实的下游，过滤时间没有交集的路径。
+
+        返回评审视图：
+        - 可直接签发：路径上每条边在查询时点都有交集且历史版本证据齐全；
+        - 需补证：路径时间相交但存在缺少历史版本的边，不能在目标日期直接下发改表；
+        - 已过滤：时间范围不相交或不覆盖目标日期的路径，不作为有效依赖参与签发。
+        同时关联该表已有变更记录的回写结论，便于打开对应变更结论核查。
+        """
+        lineage_svc = LineageGraphService()
+        detail = lineage_svc.query_relation_versions(
+            table_name,
+            target_date=target_date,
+            range_start=range_start,
+            range_end=range_end,
+            direction="downstream",
+            include_missing=True,
+        )
+
+        related_diffs = []
+        for diff in store.rows(self.MODULE):
+            diff_table = str(diff.get("变更对象", "")).split(".", 1)[0]
+            if diff_table == table_name:
+                related_diffs.append({
+                    "变更编号": diff.get("变更编号"),
+                    "变更对象": diff.get("变更对象"),
+                    "变更类型": diff.get("变更类型"),
+                    "status": diff.get("status"),
+                    "影响清单状态": diff.get("影响清单状态", "未回写"),
+                })
+
+        verifiable = [
+            {
+                "下游表": path["终点表"],
+                "路径": path["路径"],
+                "路径交集窗口": path["路径交集窗口"],
+                "评审结论": CONCLUSION_SIGNABLE,
+                "证据关系": [e["关系编号"] for e in path["边明细"]],
+            }
+            for path in detail["可直接签发路径"]
+        ]
+        evidence_gaps = [
+            {
+                "下游表": path["终点表"],
+                "路径": path["路径"],
+                "缺证关系编号": path["缺证关系编号"],
+                "评审结论": CONCLUSION_NEEDS_EVIDENCE,
+            }
+            for path in detail["需补证路径"]
+        ]
+        filtered = [
+            {
+                "下游表": path["终点表"],
+                "路径": path["路径"],
+                "评审结论": CONCLUSION_DISJOINT,
+                "路径交集窗口": path["路径交集窗口"],
+            }
+            for path in detail["时间无交集路径"]
+        ]
+        return {
+            "评审表": table_name,
+            "目标日期": target_date,
+            "查询区间": detail["查询区间"],
+            "可直接签发对象": verifiable,
+            "需补证对象": evidence_gaps,
+            "已过滤无交集路径": filtered,
+            "缺证片段": detail["缺证片段"],
+            "关联变更记录": related_diffs,
+            "评审说明": "仅可直接签发对象允许在目标日期下发改表；需补证对象须等待补采重试回证。",
+        }
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

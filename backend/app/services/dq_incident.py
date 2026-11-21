@@ -83,7 +83,8 @@ class DqIncidentService(BaseModuleService):
         entry = {
             "id": new_id,
             "事件编号": f"DQ_I-{new_id:04d}",
-            "关联规则": rule_id,
+            # 关联规则同时保留规则编号与目标表名，趋势分析按表名检索历史事件
+            "关联规则": f"{rule_id}:{table_name}",
             "触发时间": datetime.now(timezone.utc).isoformat(),
             "偏离程度": deviation,
             "影响行数": str(random.randint(500, 100000)),

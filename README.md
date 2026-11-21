@@ -16,6 +16,7 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/lineage_versions.py  血缘关系版本/历史依赖评审接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
@@ -68,6 +69,24 @@ npm run dev
 | 质量基线管理 | `dq_baseline` | 基线定义 | 基线编号、目标表名、基线指标 |
 | 主数据实体注册 | `mdm_entity` | 主数据实体 | 实体编号、实体名称、业务域 |
 | 质量趋势看板 | `dq_trend` | 趋势记录 | 记录编号、目标表名、日期 |
+
+## 关系版本与历史依赖明细
+
+血缘边携带生效时间区间（生效开始时间/生效结束时间）与版本校验状态
+（已采集/待补证/补证成功/补证失败），支撑按生效时点的历史路径审查：
+
+- `GET /api/lineage/versions`：按目标日期或时间区间查询关系版本。只有时间范围
+  相交的边才能组成有效路径；缺少历史版本的边保留为缺证片段，不会被视作无依赖。
+  结果按评审结论拆分为「可直接签发 / 需补证 / 时间无交集」三组。
+- `POST /api/lineage/retry-missing`：补采失败后重试，缺证片段与已检验路径分开
+  处理，已采集的边不会进入重试候选；`simulate_failure=true` 可复现再次失败。
+- `POST /api/lineage/diff/{diff_id}/impact`：历史查询结果回写元数据变更影响清单
+  （变更记录的「历史依赖明细/影响清单状态」字段），随变更审查保存。
+- `GET /api/lineage/review`：变更评审检索可证实的下游，过滤时间没有交集的路径，
+  并关联该表的变更记录结论，区分可直接签发与需补证对象。
+
+前端在「血缘图谱」和「元数据变更对比」模块下提供历史依赖查询面板，
+可直接对比同一目标表在两次生效交界前后的依赖差异。
 
 ## 约定
 
